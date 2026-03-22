@@ -61,3 +61,11 @@ crypto-data-pipeline/data/processed/
 crypto-data-pipeline/data/merged/
 crypto-data-pipeline/data/cache/
 crypto-data-pipeline/logs/
+
+# Backtest / CLI outputs (batch CSV, tune JSON, aggregates)
+out/
+tmp/
+scratch/
+
+# Local run logs at repo root
+*.log
