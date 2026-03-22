@@ -49,12 +49,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update-only", action="store_true")
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--report", action="store_true")
+    parser.add_argument(
+        "--merge-then-report",
+        action="store_true",
+        help="Run Step 3 (merge) then Step 4 and Step 5 sequentially.",
+    )
     parser.add_argument("--format", type=str, default="html")
     return parser
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     """Execute pipeline based on provided args."""
+    if args.merge_then_report and (args.validate or args.report):
+        raise ValueError("--merge-then-report cannot be combined with --validate/--report.")
+
     conf = load_config()
     if not validate_config(conf):
         raise ValueError("Invalid configuration from environment.")
@@ -95,7 +103,24 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     results: dict[str, Any] = {}
     try:
-        if not args.validate and not args.report:
+        if args.merge_then_report:
+            logger.info("Step 3: Merge")
+            results["merge"] = merger.merge_all(symbols, intervals)
+            checkpoint["merge_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
+
+            logger.info("Step 4: Validate merged dataset")
+            validation_df = validator.validate_all(symbols, intervals)
+            results["validation_rows"] = int(len(validation_df))
+            checkpoint["validate_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
+
+            logger.info("Step 5: Generate reports")
+            reports = validator.export_reports(validation_df)
+            results["reports"] = reports
+            checkpoint["report_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
+        elif not args.validate and not args.report:
             logger.info("Step 1: Download data")
             results["download"] = downloader.download_batch(
                 symbols, intervals, start_date, end_date
@@ -112,21 +137,40 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             results["merge"] = merger.merge_all(symbols, intervals)
             checkpoint["merge_done"] = True
             save_checkpoint(checkpoint_file, checkpoint)
+ 
+            logger.info("Step 4: Validate merged dataset")
+            validation_df = validator.validate_all(symbols, intervals)
+            results["validation_rows"] = int(len(validation_df))
+            checkpoint["validate_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
 
-        logger.info("Step 4: Validate merged dataset")
-        validation_df = validator.validate_all(symbols, intervals)
-        results["validation_rows"] = int(len(validation_df))
-        checkpoint["validate_done"] = True
-        save_checkpoint(checkpoint_file, checkpoint)
+            logger.info("Step 5: Generate reports")
+            reports = validator.export_reports(validation_df)
+            results["reports"] = reports
+            checkpoint["report_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
+        elif args.validate and not args.report:
+            logger.info("Step 4: Validate merged dataset")
+            validation_df = validator.validate_all(symbols, intervals)
+            results["validation_rows"] = int(len(validation_df))
+            checkpoint["validate_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
+        else:
+            logger.info("Step 4: Validate merged dataset")
+            validation_df = validator.validate_all(symbols, intervals)
+            results["validation_rows"] = int(len(validation_df))
+            checkpoint["validate_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
 
-        logger.info("Step 5: Generate reports")
-        reports = validator.export_reports(validation_df)
-        results["reports"] = reports
-        checkpoint["report_done"] = True
-        save_checkpoint(checkpoint_file, checkpoint)
+            logger.info("Step 5: Generate reports")
+            reports = validator.export_reports(validation_df)
+            results["reports"] = reports
+            checkpoint["report_done"] = True
+            save_checkpoint(checkpoint_file, checkpoint)
     except Exception as exc:
         logger.exception("Pipeline failed: {}", exc)
         error_path = project_root / settings.LOG_DIR / "pipeline_errors.log"
+        ensure_dir(error_path.parent)
         with open(error_path, "a") as f:
             f.write(f"{exc}\n")
         raise

@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager as fm
 import pandas as pd
 import seaborn as sns
 
-from src.utils import ensure_dir, get_interval_minutes
+from src.utils import (
+    ensure_dir,
+    get_interval_minutes,
+    normalize_open_time_ms_dataframe,
+    progress_bar,
+)
 
 
 class DataValidator:
@@ -19,36 +26,50 @@ class DataValidator:
     def __init__(self, merged_dir: str):
         self.merged_dir = Path(merged_dir)
         self.report_dir = ensure_dir(self.merged_dir.parent.parent / "logs" / "reports")
+        self._configure_plot_font()
 
-    def _normalize_open_time_ms(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize open_time to milliseconds from ns/us/ms inputs."""
-        out = df.copy()
-        if out.empty:
-            return out
-        max_ts = int(out["open_time"].max())
-        if max_ts >= 10**17:
-            out["open_time"] = (out["open_time"] // 1_000_000).astype("int64")
-        elif max_ts >= 10**14:
-            out["open_time"] = (out["open_time"] // 1_000).astype("int64")
-        return out
+    def _configure_plot_font(self) -> None:
+        """Prefer CJK-capable fonts to avoid missing-glyph warnings on Windows."""
+        candidates = [
+            "Microsoft YaHei",
+            "SimHei",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+            "Arial Unicode MS",
+        ]
+        available = {f.name for f in fm.fontManager.ttflist}
+        for name in candidates:
+            if name in available:
+                plt.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+                plt.rcParams["axes.unicode_minus"] = False
+                return
+
+    def _safe_plot_symbol(self, symbol: Any) -> str:
+        """Fallback display label when current font cannot render symbol chars."""
+        text = str(symbol)
+        try:
+            text.encode("cp1252")
+            return text
+        except UnicodeEncodeError:
+            return text.encode("ascii", "replace").decode("ascii")
 
     def check_data_continuity(self, df: pd.DataFrame, interval: str) -> list[dict[str, Any]]:
         """Find missing continuity gaps based on interval."""
         if df.empty:
             return []
-        df = self._normalize_open_time_ms(df)
+        df = normalize_open_time_ms_dataframe(df)
         minutes = get_interval_minutes(interval)
-        ts = pd.to_datetime(df["open_time"], unit="ms", utc=True).sort_values()
+        ts = pd.to_datetime(df["open_time"], unit="ms", utc=True).sort_values().reset_index(drop=True)
         expected = pd.Timedelta(minutes=minutes)
-        diffs = ts.diff().dropna()
+        diffs = ts.diff()
         gap_points = diffs[diffs > expected]
         gaps: list[dict[str, Any]] = []
         for idx, diff in gap_points.items():
-            prev_ts = ts.loc[idx - 1] if (idx - 1) in ts.index else None
+            prev_ts = ts.iloc[idx - 1] if idx > 0 else None
             gaps.append(
                 {
                     "from": str(prev_ts) if prev_ts is not None else None,
-                    "to": str(ts.loc[idx]),
+                    "to": str(ts.iloc[idx]),
                     "gap_minutes": float(diff / pd.Timedelta(minutes=1)),
                 }
             )
@@ -68,7 +89,7 @@ class DataValidator:
     def _expected_records(self, df: pd.DataFrame, interval: str) -> int:
         if df.empty:
             return 0
-        df = self._normalize_open_time_ms(df)
+        df = normalize_open_time_ms_dataframe(df)
         minutes = get_interval_minutes(interval)
         start = pd.to_datetime(df["open_time"].min(), unit="ms", utc=True)
         end = pd.to_datetime(df["open_time"].max(), unit="ms", utc=True)
@@ -99,7 +120,7 @@ class DataValidator:
         if not path.exists():
             return {"symbol": symbol, "interval": interval, "exists": False}
         df = pd.read_parquet(path)
-        df = self._normalize_open_time_ms(df)
+        df = normalize_open_time_ms_dataframe(df)
         gaps = self.check_data_continuity(df, interval)
         sanity = self._sanity_checks(df)
         outlier_count = self._outliers(df)
@@ -123,9 +144,9 @@ class DataValidator:
     def validate_all(self, symbols: list[str], intervals: list[str]) -> pd.DataFrame:
         """Validate all requested symbol/interval combinations."""
         records: list[dict[str, Any]] = []
-        for symbol in symbols:
-            for interval in intervals:
-                records.append(self.validate_symbol(symbol, interval))
+        jobs = [(symbol, interval) for symbol in symbols for interval in intervals]
+        for symbol, interval in progress_bar(jobs, desc="Validating datasets", total=len(jobs)):
+            records.append(self.validate_symbol(symbol, interval))
         return pd.DataFrame(records)
 
     def suggest_fixes(self, validation_results: dict[str, Any]) -> list[str]:
@@ -162,8 +183,13 @@ class DataValidator:
 
     def _plot_record_distribution(self, df: pd.DataFrame) -> Path:
         plt.figure(figsize=(12, 6))
-        plot_df = df[df.get("exists", True) == True]  # noqa: E712
-        sns.barplot(data=plot_df, x="symbol", y="rows", hue="interval")
+        plot_df = df[df.get("exists", True) == True].copy()  # noqa: E712
+        if "symbol" in plot_df.columns:
+            plot_df["symbol_display"] = plot_df["symbol"].map(self._safe_plot_symbol)
+            x_col = "symbol_display"
+        else:
+            x_col = "symbol"
+        sns.barplot(data=plot_df, x=x_col, y="rows", hue="interval")
         plt.title("Record Count by Symbol")
         plt.xticks(rotation=45)
         out = self.report_dir / "record_distribution.png"
@@ -187,6 +213,7 @@ class DataValidator:
     def export_reports(self, results_df: pd.DataFrame, filename_prefix: str = "validation") -> dict[str, str]:
         """Export JSON/CSV/Markdown/HTML reports with charts."""
         ensure_dir(self.report_dir)
+        warnings.filterwarnings("ignore", message=r"Glyph .* missing from font\(s\)")
         if "quality_label" not in results_df.columns:
             results_df = results_df.copy()
             results_df["quality_label"] = results_df.get("exists", False).map(
@@ -206,21 +233,39 @@ class DataValidator:
         md_path = self.report_dir / f"{filename_prefix}.md"
         html_path = self.report_dir / f"{filename_prefix}.html"
 
-        json_path.write_text(results_df.to_json(orient="records", indent=2))
-        results_df.to_csv(csv_path, index=False)
-
         lines = ["# Validation Summary", "", f"Total records: {len(results_df)}", ""]
         for _, row in results_df.iterrows():
             lines.append(
                 f"- {row['symbol']} {row['interval']}: {row['quality_label']} ({row['quality_score']})"
             )
-        md_path.write_text("\n".join(lines))
 
-        heatmap = self._plot_missing_heatmap(results_df)
-        record_dist = self._plot_record_distribution(results_df)
-        quality_plot = self._plot_quality_by_interval(results_df)
-
-        html_content = f"""
+        report_steps = [
+            "json",
+            "csv",
+            "markdown",
+            "heatmap",
+            "record_distribution",
+            "quality_plot",
+            "html",
+        ]
+        heatmap: Path | None = None
+        record_dist: Path | None = None
+        quality_plot: Path | None = None
+        for step in progress_bar(report_steps, desc="Generating reports", total=len(report_steps)):
+            if step == "json":
+                json_path.write_text(results_df.to_json(orient="records", indent=2), encoding="utf-8")
+            elif step == "csv":
+                results_df.to_csv(csv_path, index=False, encoding="utf-8")
+            elif step == "markdown":
+                md_path.write_text("\n".join(lines), encoding="utf-8")
+            elif step == "heatmap":
+                heatmap = self._plot_missing_heatmap(results_df)
+            elif step == "record_distribution":
+                record_dist = self._plot_record_distribution(results_df)
+            elif step == "quality_plot":
+                quality_plot = self._plot_quality_by_interval(results_df)
+            elif step == "html":
+                html_content = f"""
 <html>
   <head><title>Validation Dashboard</title></head>
   <body>
@@ -228,15 +273,15 @@ class DataValidator:
     <h2>Overview</h2>
     {results_df.to_html(index=False)}
     <h2>Missing Data Heatmap</h2>
-    <img src="{heatmap.name}" alt="Missing heatmap"/>
+    <img src="{heatmap.name if heatmap else 'missing_heatmap.png'}" alt="Missing heatmap"/>
     <h2>Record Distribution</h2>
-    <img src="{record_dist.name}" alt="Record distribution"/>
+    <img src="{record_dist.name if record_dist else 'record_distribution.png'}" alt="Record distribution"/>
     <h2>Quality by Interval</h2>
-    <img src="{quality_plot.name}" alt="Quality by interval"/>
+    <img src="{quality_plot.name if quality_plot else 'quality_by_interval.png'}" alt="Quality by interval"/>
   </body>
 </html>
 """
-        html_path.write_text(html_content)
+                html_path.write_text(html_content, encoding="utf-8")
         return {
             "json": str(json_path),
             "csv": str(csv_path),

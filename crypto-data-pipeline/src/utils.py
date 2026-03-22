@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from loguru import logger
@@ -22,6 +23,14 @@ from tqdm import tqdm
 
 def setup_logger(name: str, log_file: str, level: int = logging.INFO) -> logging.Logger:
     """Set up Python logger and also configure loguru sink."""
+    # Ensure parent directory exists to avoid FileNotFoundError on Windows/Linux.
+    try:
+        ensure_dir(Path(log_file).parent)
+    except Exception:
+        # If we can't create the directory for any reason, let FileHandler raise a
+        # useful exception below (permissions, invalid path, etc).
+        pass
+
     py_logger = logging.getLogger(name)
     py_logger.setLevel(level)
 
@@ -104,6 +113,41 @@ def parse_date(date_str: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unsupported date format: {date_str}")
+
+
+def normalize_open_time_to_ms_series(series: pd.Series) -> pd.Series:
+    """Convert open_time values to epoch milliseconds, row-wise.
+
+    Handles mixed units in the same column (common after merges):
+    seconds (<1e11), milliseconds (1e11..1e14), microseconds (1e14..1e17),
+    nanoseconds (>=1e17).
+    """
+    if series.empty:
+        return series
+    x = series.astype("int64").to_numpy()
+    ms = np.select(
+        [
+            x >= 10**17,
+            (x >= 10**14) & (x < 10**17),
+            x < 10**11,
+        ],
+        [
+            x // 1_000_000,
+            x // 1_000,
+            x * 1_000,
+        ],
+        default=x,
+    )
+    return pd.Series(ms, index=series.index, dtype="int64")
+
+
+def normalize_open_time_ms_dataframe(df: pd.DataFrame, col: str = "open_time") -> pd.DataFrame:
+    """Return a copy of df with open_time column normalized to milliseconds."""
+    out = df.copy()
+    if out.empty or col not in out.columns:
+        return out
+    out[col] = normalize_open_time_to_ms_series(out[col])
+    return out
 
 
 def get_interval_minutes(interval: str) -> int:

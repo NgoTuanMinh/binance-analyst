@@ -29,7 +29,7 @@ def _load_cache(cache_file: Path, ttl_seconds: int) -> list[str] | None:
 def _save_cache(cache_file: Path, symbols: list[str]) -> None:
     cache_file.parent.mkdir(parents=True, exist_ok=True)
     payload = {"created_at": time.time(), "symbols": symbols}
-    cache_file.write_text(json.dumps(payload, indent=2))
+    cache_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def fetch_top_symbols(top_n: int = 300) -> list[str]:
@@ -96,8 +96,8 @@ def main() -> None:
     output_txt = Path(args.output_txt)
     output_json.parent.mkdir(parents=True, exist_ok=True)
     output_txt.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(symbols, indent=2))
-    output_txt.write_text("\n".join(symbols))
+    output_json.write_text(json.dumps(symbols, indent=2), encoding="utf-8")
+    output_txt.write_text("\n".join(symbols), encoding="utf-8")
 
     exchange_info = requests.get(EXCHANGE_INFO_URL, timeout=20).json()
     total_usdt = len(

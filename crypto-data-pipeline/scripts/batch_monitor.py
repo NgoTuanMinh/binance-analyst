@@ -102,7 +102,7 @@ def main() -> None:
         checkpoint = _read_checkpoint(checkpoint_file)
         disk = _disk_stats(PROJECT_ROOT)
         html = _render_html(checkpoint, disk, args.warning_pct)
-        output_html.write_text(html)
+        output_html.write_text(html, encoding="utf-8")
         print(
             f"Dashboard updated: {output_html} | "
             f"progress={checkpoint.get('progress', {}).get('percent', 0)}% | "

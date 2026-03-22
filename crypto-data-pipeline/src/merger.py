@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from src.utils import ensure_dir, get_interval_minutes
+from src.utils import ensure_dir, get_interval_minutes, normalize_open_time_ms_dataframe, progress_bar
 
 KLINE_COLUMNS = [
     "open_time",
@@ -62,19 +62,6 @@ class DataMerger:
         out["volume_ma"] = out["volume"].rolling(self.volume_ma_window, min_periods=1).mean()
         return out
 
-    def _normalize_open_time_ms(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize open_time to milliseconds from ns/us/ms inputs."""
-        out = df.copy()
-        if out.empty:
-            return out
-        max_ts = int(out["open_time"].max())
-        # 1e17+ indicates nanoseconds, 1e14+ indicates microseconds.
-        if max_ts >= 10**17:
-            out["open_time"] = (out["open_time"] // 1_000_000).astype("int64")
-        elif max_ts >= 10**14:
-            out["open_time"] = (out["open_time"] // 1_000).astype("int64")
-        return out
-
     def _find_gaps(self, df: pd.DataFrame, interval: str) -> list[dict[str, str]]:
         if df.empty:
             return []
@@ -95,7 +82,7 @@ class DataMerger:
             return pd.DataFrame(columns=KLINE_COLUMNS)
         chunks = [self._read_csv(f) for f in files]
         merged = pd.concat(chunks, ignore_index=True)
-        merged = self._normalize_open_time_ms(merged)
+        merged = normalize_open_time_ms_dataframe(merged)
         merged = merged.sort_values("open_time")
         merged = merged.drop_duplicates(subset=["open_time"], keep="last")
         merged["date"] = pd.to_datetime(merged["open_time"], unit="ms", utc=True).dt.date
@@ -125,7 +112,7 @@ class DataMerger:
         csv_path = out_dir / f"{symbol}-{interval}.csv"
         meta_path = out_dir / f"{symbol}-{interval}.metadata.json"
         df.to_parquet(parquet_path, index=False)
-        df.to_csv(csv_path, index=False)
+        df.to_csv(csv_path, index=False, encoding="utf-8")
         metadata = {
             "symbol": symbol,
             "interval": interval,
@@ -134,7 +121,7 @@ class DataMerger:
             "end_time": int(df["open_time"].max()) if not df.empty else None,
             "columns": list(df.columns),
         }
-        meta_path.write_text(json.dumps(metadata, indent=2))
+        meta_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     def generate_merge_report(self, symbol: str, interval: str) -> dict[str, Any]:
         """Generate merge quality report for one symbol/interval."""
@@ -142,6 +129,7 @@ class DataMerger:
         if not parquet_path.exists():
             return {"symbol": symbol, "interval": interval, "exists": False}
         df = pd.read_parquet(parquet_path)
+        df = normalize_open_time_ms_dataframe(df)
         gaps = self._find_gaps(df, interval)
         quality_score = max(0, 100 - (len(gaps) * 5))
         return {
@@ -160,14 +148,14 @@ class DataMerger:
         success = 0
         failed = 0
         reports: list[dict[str, Any]] = []
-        for symbol in symbols:
-            for interval in intervals:
-                try:
-                    df = self.merge_symbol_interval(symbol, interval)
-                    self._write_outputs(symbol, interval, df)
-                    reports.append(self.generate_merge_report(symbol, interval))
-                    success += 1
-                except Exception as exc:
-                    failed += 1
-                    logger.exception("Merge failed for {} {}: {}", symbol, interval, exc)
+        jobs = [(symbol, interval) for symbol in symbols for interval in intervals]
+        for symbol, interval in progress_bar(jobs, desc="Merging datasets", total=len(jobs)):
+            try:
+                df = self.merge_symbol_interval(symbol, interval)
+                self._write_outputs(symbol, interval, df)
+                reports.append(self.generate_merge_report(symbol, interval))
+                success += 1
+            except Exception as exc:
+                failed += 1
+                logger.exception("Merge failed for {} {}: {}", symbol, interval, exc)
         return {"success": success, "failed": failed, "reports": reports}

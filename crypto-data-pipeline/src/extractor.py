@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from src.utils import ensure_dir
+from src.utils import ensure_dir, progress_bar
 
 KLINE_COLUMNS = [
     "open_time",
@@ -76,7 +76,7 @@ class DataExtractor:
         zip_files = list(self.raw_dir.rglob("*.zip"))
         success = 0
         failed = 0
-        for z in zip_files:
+        for z in progress_bar(zip_files, desc="Extracting and validating", total=len(zip_files)):
             try:
                 extracted = self.extract_zip(z)
                 for f in extracted:
