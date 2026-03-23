@@ -90,6 +90,10 @@ python scripts/generate_features.py --symbols BTCUSDT --intervals 15m 1h 4h \
 | `--start` / `--end` | UTC. Nếu chỉ ghi ngày (`YYYY-MM-DD`), **end** được hiểu là **hết ngày đó** |
 | `--merged-dir` | Mặc định `crypto-data-pipeline/data/merged` |
 | `--output-dir` | Mặc định `features/data` — mỗi symbol một file `{SYMBOL}_features.parquet` |
+| `--strict` | Nếu **bật**: lỗi ngay khi một symbol **không** có đủ file Parquet merged; mặc định **tắt** → **bỏ qua** symbol thiếu dữ liệu (in cảnh báo ra stderr) |
+| `--no-progress` | Tắt thanh `tqdm` (chỉ script `generate_features.py`; xem mục **Tiến trình** bên dưới) |
+
+**Lưu ý:** Danh sách `top_100` / `top_300` có thể chứa symbol bạn **chưa tải/merge** — khi đó không phải lỗi code mà thiếu file; chạy không `--strict` sẽ chỉ xử lý symbol đủ `15m`/`1h`/`4h` Parquet.
 
 ### Cách 2 — Class `FeaturePipeline` (Python)
 
@@ -112,7 +116,8 @@ pl = FeaturePipeline(
     # target_horizons=(1, 4, 16, 96),
 )
 
-pl.load_data()              # đọc merged Parquet cho từng symbol
+pl.load_data()                          # mặc định: bỏ qua symbol không đủ file merged
+pl.load_data(skip_missing_symbols=False)  # fail ngay nếu thiếu Parquet (giống hành vi cũ)
 pl.generate_all_features()  # technical + price_action + smart_money + regime + targets
 paths = pl.save_features()  # dict symbol -> Path parquet
 
@@ -163,6 +168,13 @@ df = build_feature_matrix("BTCUSDT", frames)
 ### Dependencies
 
 `pandas`, `numpy`, `pyarrow` (Parquet).
+
+### Tiến trình (progress)
+
+- **`FeaturePipeline`**: ba bước **Load merged Parquet → Build feature matrix → Save Parquet** mỗi bước có thanh **`tqdm`** trên **stderr** (kèm tiền tố `[features]`).
+- **Tắt progress**: `FeaturePipeline(..., show_progress=False)` hoặc script `scripts/generate_features.py --no-progress`; module CLI `python -m features.pipeline --no-progress`.
+- **Song song** (`--workers` > 1): thanh tiến trình đếm số job **hoàn thành** (không phải thứ tự symbol).
+- Nếu **chưa cài `tqdm`**, code in từng dòng `[features] … [i/N] SYMBOL` ra stderr (fallback).
 
 ---
 

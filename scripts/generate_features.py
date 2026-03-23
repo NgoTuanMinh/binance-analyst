@@ -63,6 +63,16 @@ def main() -> None:
         help="If set, print JSON top-20 |correlation| with this target column after build",
     )
     parser.add_argument("--correlation-method", choices=("pearson", "spearman"), default="pearson")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail if any symbol lacks merged Parquet (default: skip missing symbols)",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars on stderr",
+    )
     args = parser.parse_args()
 
     pl = FeaturePipeline(
@@ -72,10 +82,11 @@ def main() -> None:
         args.end,
         merged_dir=Path(args.merged_dir),
         output_dir=Path(args.output_dir),
+        show_progress=not args.no_progress,
         include_targets=not args.no_targets,
         include_trade_targets=not args.no_trade_targets,
     )
-    pl.load_data()
+    pl.load_data(skip_missing_symbols=not args.strict)
     pl.generate_all_features()
     paths = pl.save_features(compression=args.compression)
     for sym, p in sorted(paths.items()):

@@ -12,9 +12,11 @@ import json
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence, TypeVar
 
 import numpy as np
+
+_T = TypeVar("_T")
 import pandas as pd
 
 # Repo root (parent of ``features/``)
@@ -29,6 +31,37 @@ _DEFAULT_TIMEFRAMES = ("M15", "H1", "H4")
 def _ensure_sys_path() -> None:
     if str(_REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(_REPO_ROOT))
+
+
+def iter_with_progress(
+    items: Sequence[_T],
+    *,
+    desc: str,
+    enabled: bool = True,
+) -> Iterator[_T]:
+    """
+    Yield ``items`` with an optional ``tqdm`` bar on stderr (falls back to simple counter
+    if ``tqdm`` is not installed).
+    """
+    if not enabled or len(items) == 0:
+        yield from items
+        return
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        n = len(items)
+        for i, x in enumerate(items):
+            print(f"[features] {desc} [{i + 1}/{n}] {x}", file=sys.stderr, flush=True)
+            yield x
+        return
+    yield from tqdm(
+        items,
+        desc=f"[features] {desc}",
+        file=sys.stderr,
+        unit="sym",
+        dynamic_ncols=True,
+        mininterval=0.25,
+    )
 
 
 def normalize_interval_labels(intervals: Sequence[str]) -> list[str]:
@@ -119,6 +152,38 @@ def resolve_symbols_argument(
         raise ValueError(f"Unrecognized symbols JSON structure in {p}")
 
     return [x.strip().upper() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
+def filter_symbols_with_merged_data(
+    symbols: Sequence[str],
+    merged_dir: Path | str,
+    intervals: Sequence[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Split symbols into those that have **all** required Parquet files vs missing.
+
+    Expected layout: ``{merged_dir}/{SYMBOL}/{SYMBOL}-{interval}.parquet`` for each
+    canonical interval (e.g. 15m, 1h, 4h).
+    """
+    md = Path(merged_dir)
+    canonical = normalize_interval_labels(intervals)
+    available: list[str] = []
+    missing: list[str] = []
+    for s in symbols:
+        sy = str(s).strip().upper()
+        if not sy:
+            continue
+        ok = True
+        for iv in canonical:
+            p = md / sy / f"{sy}-{iv}.parquet"
+            if not p.is_file():
+                ok = False
+                break
+        if ok:
+            available.append(sy)
+        else:
+            missing.append(sy)
+    return available, missing
 
 
 def load_mtf_frames(
@@ -217,6 +282,8 @@ class FeaturePipeline:
 
     Requires **15m** in ``intervals`` (base bar series). Default merged root:
     ``crypto-data-pipeline/data/merged``.
+
+    Set ``show_progress=False`` to disable ``tqdm`` bars on stderr during load / build / save.
     """
 
     def __init__(
@@ -228,6 +295,7 @@ class FeaturePipeline:
         *,
         merged_dir: Path | str | None = None,
         output_dir: str | Path | None = None,
+        show_progress: bool = True,
         **feature_matrix_kwargs: Any,
     ) -> None:
         self.symbols = resolve_symbols_argument(symbols)
@@ -240,14 +308,53 @@ class FeaturePipeline:
         self.start_ms, self.end_ms = _date_strings_to_ms_range(start_date, end_date)
         self.merged_dir = Path(merged_dir) if merged_dir is not None else _DEFAULT_MERGED
         self.output_dir = Path(output_dir) if output_dir is not None else _DEFAULT_FEATURE_DATA
+        self.show_progress = bool(show_progress)
         self._feature_matrix_kwargs = feature_matrix_kwargs
         self._frames_by_symbol: dict[str, dict[str, pd.DataFrame]] = {}
         self._feature_by_symbol: dict[str, pd.DataFrame] = {}
+        self.symbols_skipped_missing_data: list[str] = []
 
-    def load_data(self) -> FeaturePipeline:
-        """Load ``data/merged`` Parquet for all ``self.symbols`` and ``self.intervals``."""
+    def load_data(self, *, skip_missing_symbols: bool = True) -> FeaturePipeline:
+        """
+        Load ``data/merged`` Parquet for ``self.symbols`` and ``self.intervals``.
+
+        If ``skip_missing_symbols`` is True (default), symbols without **all** interval
+        files under ``merged_dir`` are skipped (see :func:`filter_symbols_with_merged_data`)
+        and listed in ``self.symbols_skipped_missing_data``; a summary is printed to stderr.
+        If False, the first missing file raises ``FileNotFoundError`` (strict mode).
+
+        Progress bar: controlled by ``self.show_progress`` (``tqdm`` on stderr when available).
+        """
         self._frames_by_symbol.clear()
-        for sym in self.symbols:
+        self.symbols_skipped_missing_data = []
+
+        to_load = list(self.symbols)
+        if skip_missing_symbols:
+            available, missing = filter_symbols_with_merged_data(
+                self.symbols, self.merged_dir, self.intervals
+            )
+            self.symbols_skipped_missing_data = missing
+            if missing:
+                preview = ", ".join(missing[:15])
+                more = f" … (+{len(missing) - 15} more)" if len(missing) > 15 else ""
+                print(
+                    f"[features] Skipping {len(missing)} symbol(s) without merged Parquet for "
+                    f"{self.intervals}: {preview}{more}",
+                    file=sys.stderr,
+                )
+            if not available:
+                raise FileNotFoundError(
+                    f"No symbols left after filter; merged_dir={self.merged_dir!s} "
+                    f"intervals={self.intervals}. Example missing: {missing[:5]}"
+                )
+            to_load = available
+            self.symbols = available
+
+        for sym in iter_with_progress(
+            to_load,
+            desc="Load merged Parquet",
+            enabled=self.show_progress and len(to_load) > 0,
+        ):
             self._frames_by_symbol[sym] = load_mtf_frames(
                 sym,
                 self.merged_dir,
@@ -262,8 +369,15 @@ class FeaturePipeline:
         if not self._frames_by_symbol:
             self.load_data()
         self._feature_by_symbol.clear()
-        for sym, frames in self._frames_by_symbol.items():
-            self._feature_by_symbol[sym] = build_feature_matrix(sym, frames, **self._feature_matrix_kwargs)
+        syms = list(self._frames_by_symbol.keys())
+        for sym in iter_with_progress(
+            syms,
+            desc="Build feature matrix",
+            enabled=self.show_progress and len(syms) > 0,
+        ):
+            self._feature_by_symbol[sym] = build_feature_matrix(
+                sym, self._frames_by_symbol[sym], **self._feature_matrix_kwargs
+            )
         return self
 
     def save_features(
@@ -278,8 +392,14 @@ class FeaturePipeline:
         if not self._feature_by_symbol:
             raise RuntimeError("Call generate_all_features() before save_features().")
         paths: dict[str, Path] = {}
-        for sym, df in self._feature_by_symbol.items():
+        syms = list(self._feature_by_symbol.keys())
+        for sym in iter_with_progress(
+            syms,
+            desc="Save Parquet",
+            enabled=self.show_progress and len(syms) > 0,
+        ):
             p = out / f"{sym}_features.parquet"
+            df = self._feature_by_symbol[sym]
             df.to_parquet(p, index=False, compression=compression)
             paths[sym] = p
         return paths
@@ -422,6 +542,7 @@ def run_parallel(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     root = str(_REPO_ROOT)
+    show_progress = bool(kwargs.pop("show_progress", True))
     payloads = [
         {
             "root": root,
@@ -436,7 +557,22 @@ def run_parallel(
     results: dict[str, str | None] = {}
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(_worker, p): p["symbol"] for p in payloads}
-        for fut in as_completed(futs):
+        done_iter = as_completed(futs)
+        if show_progress and len(futs) > 0:
+            try:
+                from tqdm import tqdm
+
+                done_iter = tqdm(
+                    done_iter,
+                    total=len(futs),
+                    desc="[features] Parallel symbols",
+                    file=sys.stderr,
+                    unit="sym",
+                    dynamic_ncols=True,
+                )
+            except ImportError:
+                pass
+        for fut in done_iter:
             sym, path, err = fut.result()
             if err:
                 print(f"[features] ERROR {sym}: {err}", file=sys.stderr)
@@ -458,6 +594,11 @@ def main() -> None:
     parser.add_argument("--end-ms", type=int, default=None)
     parser.add_argument("--no-targets", action="store_true")
     parser.add_argument("--compression", type=str, default="snappy")
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable tqdm progress bars (stderr)",
+    )
     args = parser.parse_args()
 
     symbols: list[str] = []
@@ -486,14 +627,20 @@ def main() -> None:
     if args.end_ms is not None:
         kw["end_ms"] = args.end_ms
 
+    show_p = not args.no_progress
     if args.workers <= 1:
-        for sym in symbols:
+        for sym in iter_with_progress(
+            symbols,
+            desc="Build & write symbol",
+            enabled=show_p and len(symbols) > 0,
+        ):
             try:
                 p = build_and_write_symbol(sym, args.merged_dir, args.output_dir, **kw)
                 print(p)
             except Exception as exc:
                 print(f"[features] ERROR {sym}: {exc}", file=sys.stderr)
     else:
+        kw["show_progress"] = show_p
         out = run_parallel(symbols, args.merged_dir, args.output_dir, max_workers=args.workers, **kw)
         print(json.dumps(out, indent=2))
 
