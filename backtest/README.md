@@ -38,6 +38,25 @@ python scripts/run_backtest.py \
   --start 2024-01-01 --end 2024-12-31
 ```
 
+**Windows PowerShell:** không dùng `\` xuống dòng như Bash — PowerShell coi `--` ở dòng sau là lỗi. Chọn một trong hai cách:
+
+- **Một dòng** (khuyến nghị):
+
+```powershell
+python scripts/run_backtest.py --symbols-json crypto-data-pipeline/config/top_300_symbols.json --continue-on-error --no-progress --batch-summary-csv out/batch_summary.csv --start 2024-01-01 --end 2024-12-31
+```
+
+- **Nhiều dòng:** ký tự tiếp tục dòng là **backtick** `` ` `` (không phải `\`):
+
+```powershell
+python scripts/run_backtest.py `
+  --symbols-json crypto-data-pipeline/config/top_300_symbols.json `
+  --continue-on-error `
+  --no-progress `
+  --batch-summary-csv out/batch_summary.csv `
+  --start 2024-01-01 --end 2024-12-31
+```
+
 Trên máy nhiều CPU, thêm `--workers N` để chạy **song song từng symbol** (chỉ khi có **từ 2 symbol** trở lên). Ví dụ `--workers 8` hoặc `--workers 0` (dùng `os.cpu_count()`). Chi tiết: mục **Song song CPU (`--workers`)** bên dưới.
 
 Mỗi symbol cần đủ `15m` / `1h` / `4h` Parquet trong `merged_dir`; thiếu sẽ ghi `status=missing_parquet` trong summary.
