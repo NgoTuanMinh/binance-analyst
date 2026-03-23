@@ -69,3 +69,7 @@ scratch/
 
 # Local run logs at repo root
 *.log
+
+# ML feature exports (Parquet)
+features_output/
+features/data/
