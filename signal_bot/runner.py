@@ -25,7 +25,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -49,12 +49,12 @@ from backtest.strategies.swing_strategy import SwingTradingStrategy
 from signal_bot.klines_cache import load_mtf_cached
 from signal_bot.telegram_notify import send_message
 
+# Hiển thị thời điểm mở nến M15 trong tin Telegram (dữ liệu Binance vẫn là UTC).
+_DISPLAY_TZ = timezone(timedelta(hours=7))
 
 
-
-
-def _fmt_ts_utc(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def _fmt_bar_open_time(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000.0, tz=_DISPLAY_TZ).strftime("%Y-%m-%d %H:%M (UTC+7)")
 
 
 def _format_signal_message(symbol: str, sig: Signal) -> str:
@@ -71,7 +71,7 @@ def _format_signal_message(symbol: str, sig: Signal) -> str:
     sl_pct = float(sig.meta.get("stop_loss_pct", 0.0)) * 100.0
     tp_pct = float(sig.meta.get("take_profit_pct", 0.0)) * 100.0
     ts_h = int(sig.meta.get("time_stop_ms", 0)) // (3600 * 1000)
-    t_bar = _fmt_ts_utc(int(sig.time))
+    t_bar = _fmt_bar_open_time(int(sig.time))
     return "\n".join(
         [
             f"{emoji} *{symbol}* `{side}`",

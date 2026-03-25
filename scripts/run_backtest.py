@@ -19,6 +19,9 @@ Examples::
 
     python scripts/run_backtest.py --symbols BTCUSDT,ETHUSDT --workers 4 --no-progress \\
         --batch-summary-csv out/batch_summary.csv
+
+    python scripts/run_backtest.py --portfolio --symbols BTCUSDT,ETHUSDT,SOLUSDT \\
+        --start 2024-01-01 --end 2024-06-01 --max-open-symbols 5 --position-size-pct 0.2
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from backtest.engine import (
     compare_runs,
     read_trades_csv,
 )
-from backtest.symbol_job import mp_auto_tune_pack, mp_run_symbol_pack, run_one_symbol_job
+from backtest.symbol_job import mp_auto_tune_pack, mp_run_symbol_pack, run_one_symbol_job, run_portfolio_job
 
 
 def _day_start_utc_ms(date_str: str) -> int:
@@ -299,6 +302,25 @@ def main() -> int:
     p.add_argument("--start", type=str, default=None, help="Start UTC YYYY-MM-DD")
     p.add_argument("--end", type=str, default=None, help="End UTC YYYY-MM-DD")
     p.add_argument("--capital", type=float, default=None)
+    p.add_argument(
+        "--portfolio",
+        action="store_true",
+        help="Một ví chung: tối đa N symbol có vị thế; mỗi lệnh ~pct equity (xem --max-open-symbols, --position-size-pct)",
+    )
+    p.add_argument(
+        "--max-open-symbols",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Với --portfolio: số symbol tối đa cùng lúc (mặc định từ default_config)",
+    )
+    p.add_argument(
+        "--position-size-pct",
+        type=float,
+        default=None,
+        metavar="F",
+        help="Với --portfolio: phần equity cho mỗi lệnh mới, ví dụ 0.2 = 20%% (mặc định từ default_config)",
+    )
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--export-trades-csv", type=Path, default=None)
     p.add_argument("--export-summary", type=Path, default=None)
@@ -380,6 +402,37 @@ def main() -> int:
     }
 
     args._multi_symbol_run = len(symbols) > 1
+
+    if args.portfolio:
+        if args.auto_tune:
+            print("Cannot combine --portfolio with --auto-tune.", file=sys.stderr)
+            return 2
+        mo = (
+            int(args.max_open_symbols)
+            if args.max_open_symbols is not None
+            else int(base.get("portfolio_max_open_symbols", 5))
+        )
+        pp = (
+            float(args.position_size_pct)
+            if args.position_size_pct is not None
+            else float(base.get("portfolio_position_size_pct", 0.2))
+        )
+        if mo < 1:
+            mo = 1
+        if pp <= 0:
+            print("--position-size-pct must be > 0.", file=sys.stderr)
+            return 2
+        try:
+            code, row = run_portfolio_job(symbols, args, strategy_cfg, engine_cfg, mo, pp)
+        except Exception as e:
+            code, row = 1, {"symbol": "PORTFOLIO", "status": "exception", "error": str(e)}
+            print(f"[PORTFOLIO] Unhandled error: {e}", file=sys.stderr)
+        if args.batch_summary_csv:
+            out_p = Path(args.batch_summary_csv)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([_sanitize_summary_row(row)]).to_csv(out_p, index=False)
+            print(f"\nWrote batch summary: {out_p}", flush=True)
+        return code
 
     if args.auto_tune:
         n_sym = len(symbols)

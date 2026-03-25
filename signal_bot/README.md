@@ -81,7 +81,7 @@ Entry (M15 close): `65000`
 SL: `62725` (~3.50%)
 TP: `69225` (~6.50%)
 Time stop: ~96h from bar open
-M15 bar open: `2025-03-25 14:15 UTC`
+M15 bar open: `2025-03-25 21:15 (UTC+7)`  *(cùng thời điểm 14:15 UTC)*
 
 _Manual execution only — not financial advice._
 ```
