@@ -77,6 +77,14 @@ def smart_money_features(
     c = work["close"].astype(float)
     o = work["open"].astype(float)
     v = work["volume"].astype(float)
+    # Ensure running extrema ops (`cummax`/`cummin`) see numeric dtypes.
+    # Without this, `work["high"]` / `work["low"]` may still be `object` (e.g. strings),
+    # which breaks `groupby(...).cummax()` at runtime.
+    work["high"] = h
+    work["low"] = l_
+    work["close"] = c
+    work["open"] = o
+    work["volume"] = v
     n = len(work)
     rng = (h - l_).replace(0, np.nan)
 

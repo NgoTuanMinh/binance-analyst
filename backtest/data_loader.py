@@ -232,6 +232,11 @@ class BacktestDataLoader:
                 c: (f"{iv}_{c}" if c != "open_time" else r_time) for c in right.columns
             }
             right = right.rename(columns=rename_r)
+            
+            # Ensure merge keys are numeric to prevent MergeError
+            left['open_time'] = pd.to_numeric(left['open_time'], errors='coerce')
+            right[r_time] = pd.to_numeric(right[r_time], errors='coerce')
+            
             left = pd.merge_asof(
                 left,
                 right,

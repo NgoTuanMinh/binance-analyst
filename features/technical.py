@@ -296,7 +296,9 @@ def _merge_timeframes(
     frames: Mapping[str, pd.DataFrame],
 ) -> pd.DataFrame:
     """Merge feature columns from higher TFs onto base using backward as-of join."""
-    left = base.sort_values("open_time").copy()
+    # Avoid deep-copying large, wide frames here (can trigger big temporary allocations
+    # during block consolidation). ``sort_values`` already materializes a new frame.
+    left = base.sort_values("open_time")
     for tf_label, other in frames.items():
         if other is None or other.empty:
             continue

@@ -258,6 +258,28 @@ def _add_trade_targets(
     cfg = {**DEFAULT_BACKTEST_CONFIG, **(dict(config) if config else {})}
     strat = SwingTradingStrategy(cfg)
     prepared = strat.prepare(prep)
+    # Keep strategy prep narrow to avoid large DataFrame copies inside `strat.prepare`.
+    # Only columns used by SwingTradingStrategy are required.
+    # need_cols = [
+    #     "open_time",
+    #     "open",
+    #     "high",
+    #     "low",
+    #     "close",
+    #     "15m_open",
+    #     "15m_high",
+    #     "15m_low",
+    #     "15m_close",
+    #     "1h_high",
+    #     "1h_low",
+    #     "1h_close",
+    #     "4h_high",
+    #     "4h_low",
+    #     "4h_close",
+    # ]
+    # prep_min = prep[[c for c in need_cols if c in prep.columns]]
+    # prepared = strat.prepare(prep_min)
+
 
     max_bars = max(1, int(round(float(cfg["time_stop_hours"]) * 60.0 / float(bar_minutes))))
 
