@@ -73,3 +73,6 @@ scratch/
 # ML feature exports (Parquet)
 features_output/
 features/data/
+
+# Live signal bot: kline Parquet cache + dedup state
+data/signal_klines_cache/
