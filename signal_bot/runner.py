@@ -50,8 +50,7 @@ from signal_bot.klines_cache import load_mtf_cached
 from signal_bot.telegram_notify import send_message
 
 
-def _parse_symbols(s: str) -> list[str]:
-    return [x.strip().upper() for x in s.replace(";", ",").split(",") if x.strip()]
+
 
 
 def _fmt_ts_utc(ms: int) -> str:
@@ -159,11 +158,6 @@ def run_loop(
 def main() -> None:
     p = argparse.ArgumentParser(description="Swing signal Telegram poller (Binance + disk cache)")
     p.add_argument(
-        "--symbols",
-        default=os.environ.get("SIGNAL_SYMBOLS", "BTCUSDT"),
-        help="Comma-separated symbols (default env SIGNAL_SYMBOLS or BTCUSDT)",
-    )
-    p.add_argument(
         "--poll-sec",
         type=float,
         default=float(os.environ.get("SIGNAL_POLL_SEC", "60")),
@@ -201,7 +195,11 @@ def main() -> None:
     cache_dir = Path(args.cache_dir).resolve()
     state_path = Path(args.state_path).resolve() if args.state_path else (cache_dir / "signal_state.json")
 
-    symbols = _parse_symbols(args.symbols)
+    # Load symbols from JSON file
+    symbols_file = _ROOT / "crypto-data-pipeline" / "config" / "top_300_symbols.json"
+    with open(symbols_file, "r") as f:
+        symbols = json.load(f)
+
     run_loop(
         symbols=symbols,
         cache_dir=cache_dir,
