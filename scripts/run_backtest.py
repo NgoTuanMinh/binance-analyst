@@ -321,6 +321,18 @@ def main() -> int:
         metavar="F",
         help="Với --portfolio: phần equity cho mỗi lệnh mới, ví dụ 0.2 = 20%% (mặc định từ default_config)",
     )
+    p.add_argument(
+        "--no-portfolio-yearly",
+        action="store_true",
+        help="Với --portfolio: nạp cả khoảng ngày một lần (rất tốn RAM). Mặc định: chia theo năm dương lịch khi có --start và --end.",
+    )
+    p.add_argument(
+        "--portfolio-warmup-days",
+        type=int,
+        default=None,
+        metavar="D",
+        help="Số ngày nến trước đầu mỗi năm để warmup chỉ báo (default từ default_config)",
+    )
     p.add_argument("--no-progress", action="store_true")
     p.add_argument("--export-trades-csv", type=Path, default=None)
     p.add_argument("--export-summary", type=Path, default=None)
@@ -422,8 +434,22 @@ def main() -> int:
         if pp <= 0:
             print("--position-size-pct must be > 0.", file=sys.stderr)
             return 2
+        wd = (
+            int(args.portfolio_warmup_days)
+            if getattr(args, "portfolio_warmup_days", None) is not None
+            else int(base.get("portfolio_yearly_warmup_days", 120))
+        )
         try:
-            code, row = run_portfolio_job(symbols, args, strategy_cfg, engine_cfg, mo, pp)
+            code, row = run_portfolio_job(
+                symbols,
+                args,
+                strategy_cfg,
+                engine_cfg,
+                mo,
+                pp,
+                portfolio_yearly=not args.no_portfolio_yearly,
+                portfolio_warmup_days=wd,
+            )
         except Exception as e:
             code, row = 1, {"symbol": "PORTFOLIO", "status": "exception", "error": str(e)}
             print(f"[PORTFOLIO] Unhandled error: {e}", file=sys.stderr)

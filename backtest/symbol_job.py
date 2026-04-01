@@ -7,14 +7,21 @@ so ``ProcessPoolExecutor`` can pickle them on Windows/macOS spawn.
 
 from __future__ import annotations
 
+import gc
 import sys
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
 from backtest.data_loader import BacktestDataLoader
-from backtest.engine import BacktestEngine, auto_tune, save_run_summary, trades_to_dataframe
-from backtest.portfolio_engine import run_portfolio_backtest
+from backtest.engine import BacktestEngine, _OpenPosition, auto_tune, save_run_summary, trades_to_dataframe
+from backtest.models import BacktestResult
+from backtest.portfolio_engine import (
+    _finalize_metrics,
+    iter_year_chunk_bounds,
+    run_portfolio_backtest,
+    run_portfolio_simulation,
+)
 from backtest.strategies.swing_strategy import SwingTradingStrategy
 
 
@@ -112,8 +119,40 @@ def run_portfolio_job(
     engine_cfg: dict[str, Any],
     max_open_symbols: int,
     position_size_pct: float,
+    *,
+    portfolio_yearly: bool = True,
+    portfolio_warmup_days: int = 120,
 ) -> tuple[int, dict[str, Any]]:
-    """Shared-cash backtest across symbols (see ``run_portfolio_backtest``)."""
+    """Shared-cash backtest. By default splits by calendar year to cap RAM (requires --start/--end)."""
+    if portfolio_yearly and args.start_ms is not None and args.end_ms is not None:
+        return run_portfolio_job_yearly(
+            symbols,
+            args,
+            strategy_cfg,
+            engine_cfg,
+            max_open_symbols,
+            position_size_pct,
+            portfolio_warmup_days=portfolio_warmup_days,
+        )
+    return run_portfolio_job_single(
+        symbols,
+        args,
+        strategy_cfg,
+        engine_cfg,
+        max_open_symbols,
+        position_size_pct,
+    )
+
+
+def run_portfolio_job_single(
+    symbols: list[str],
+    args: Namespace,
+    strategy_cfg: dict[str, Any],
+    engine_cfg: dict[str, Any],
+    max_open_symbols: int,
+    position_size_pct: float,
+) -> tuple[int, dict[str, Any]]:
+    """One pass: load full [start_ms, end_ms] for all symbols (high RAM on long ranges)."""
     base_row: dict[str, Any] = {"symbol": "PORTFOLIO"}
     loader = BacktestDataLoader(merged_dir=args.merged_dir)
     prepared_by_symbol: dict[str, Any] = {}
@@ -153,11 +192,176 @@ def run_portfolio_job(
         max_open_symbols=max_open_symbols,
         position_size_pct=position_size_pct,
     )
-    m = result.metrics
+    return _portfolio_job_finish(ok_symbols, result, args, strategy_cfg, base_row, max_open_symbols, position_size_pct)
 
+
+def run_portfolio_job_yearly(
+    symbols: list[str],
+    args: Namespace,
+    strategy_cfg: dict[str, Any],
+    engine_cfg: dict[str, Any],
+    max_open_symbols: int,
+    position_size_pct: float,
+    *,
+    portfolio_warmup_days: int,
+) -> tuple[int, dict[str, Any]]:
+    """Year-by-year: load → prepare → simulate → carry cash/positions; drop prepared between years."""
+    base_row: dict[str, Any] = {"symbol": "PORTFOLIO"}
+    g0, g1 = int(args.start_ms), int(args.end_ms)
+    chunks = iter_year_chunk_bounds(g0, g1, portfolio_warmup_days)
+    if not chunks:
+        return 1, {**base_row, "status": "no_data", "error": "empty year range"}
+
+    loader = BacktestDataLoader(merged_dir=args.merged_dir)
+    first = chunks[0]
+    ok_symbols: list[str] = []
+    for sym in symbols:
+        try:
+            aligned = loader.load_aligned(
+                sym,
+                ["M15", "H1", "H4"],
+                start_ms=first["load_start_ms"],
+                end_ms=first["load_end_ms"],
+            )
+        except FileNotFoundError as e:
+            print(f"[{sym}] skip: {e}", file=sys.stderr)
+            continue
+        if aligned.empty:
+            print(f"[{sym}] skip: empty range (first year chunk)", file=sys.stderr)
+            continue
+        ok_symbols.append(sym)
+
+    if not ok_symbols:
+        return 1, {**base_row, "status": "no_data", "error": "no symbols with merged Parquet in first chunk"}
+
+    global_ic = float(engine_cfg.get("initial_capital", 10_000.0))
+    comm = engine_cfg.get("commission_rate")
+    slip = engine_cfg.get("slippage_bps")
+
+    all_trades: list = []
+    all_equity: list[tuple[int, float]] = []
+    carry_cash = global_ic
+    carry_pos: dict[str, _OpenPosition] | None = None
+    last_sim_ts: int | None = None
+    last_interval = "15m"
+
+    for ci, chunk in enumerate(chunks):
+        y = chunk["year"]
+        print(f"\n=== PORTFOLIO year {y} ({ci + 1}/{len(chunks)}) load [{chunk['load_start_ms']} .. {chunk['load_end_ms']}] ===", flush=True)
+        prepared_by_symbol: dict[str, Any] = {}
+        for sym in ok_symbols:
+            try:
+                aligned = loader.load_aligned(
+                    sym,
+                    ["M15", "H1", "H4"],
+                    start_ms=chunk["load_start_ms"],
+                    end_ms=chunk["load_end_ms"],
+                )
+            except FileNotFoundError as e:
+                print(f"[{y}][{sym}] skip: {e}", file=sys.stderr)
+                continue
+            if aligned.empty:
+                continue
+            strat = SwingTradingStrategy(config=strategy_cfg)
+            prepared_by_symbol[sym] = strat.prepare(aligned)
+            del aligned
+        if not prepared_by_symbol:
+            print(f"[{y}] No prepared data for any symbol; carrying state forward.", file=sys.stderr)
+            last_sim_ts = chunk["load_end_ms"]
+            continue
+
+        if carry_pos:
+            for sym in carry_pos:
+                if sym not in prepared_by_symbol:
+                    print(
+                        f"[{y}] ERROR: open position on {sym} but no merged data in this chunk; "
+                        "check Parquet / range.",
+                        file=sys.stderr,
+                    )
+                    return 1, {
+                        **base_row,
+                        "status": "carry_missing_symbol",
+                        "error": f"year {y}: carried position on {sym} without data in chunk",
+                    }
+
+        use_syms = [s for s in ok_symbols if s in prepared_by_symbol]
+        engine = BacktestEngine(
+            initial_capital=carry_cash,
+            commission_rate=comm,
+            slippage_bps=slip,
+            show_progress=not args.no_progress,
+        )
+        is_last = ci == len(chunks) - 1
+        r, carry = run_portfolio_simulation(
+            use_syms,
+            prepared_by_symbol,
+            strategy_cfg,
+            engine,
+            max_open_symbols=max_open_symbols,
+            position_size_pct=position_size_pct,
+            initial_cash=carry_cash,
+            initial_positions=carry_pos,
+            entry_signal_start_ms=chunk["entry_start_ms"],
+            entry_signal_end_ms=chunk["entry_end_ms"],
+            sim_time_after_ms=last_sim_ts,
+            close_all_at_end=is_last,
+            metrics_initial_capital=global_ic,
+        )
+        last_interval = r.interval
+        all_trades.extend(r.trades)
+        all_equity.extend(r.equity_curve)
+        carry_cash = carry.cash
+        carry_pos = carry.positions if carry.positions else None
+
+        if r.equity_curve:
+            last_sim_ts = r.equity_curve[-1][0]
+        else:
+            mx = 0
+            for df in prepared_by_symbol.values():
+                if not df.empty and "open_time" in df.columns:
+                    mx = max(mx, int(df["open_time"].max()))
+            last_sim_ts = mx if mx else chunk["load_end_ms"]
+
+        del prepared_by_symbol
+        gc.collect()
+
+    engine_report = BacktestEngine(
+        initial_capital=global_ic,
+        commission_rate=comm,
+        slippage_bps=slip,
+        show_progress=False,
+    )
+    metrics = _finalize_metrics(engine_report, all_trades, all_equity, initial_capital_override=global_ic)
+    metrics["portfolio_max_open_symbols"] = max_open_symbols
+    metrics["portfolio_position_size_pct"] = position_size_pct
+    metrics["portfolio_symbols"] = list(ok_symbols)
+    metrics["portfolio_yearly"] = True
+    metrics["portfolio_yearly_chunks"] = len(chunks)
+    metrics["portfolio_yearly_warmup_days"] = portfolio_warmup_days
+
+    result = BacktestResult(
+        symbol="PORTFOLIO",
+        interval=last_interval,
+        trades=all_trades,
+        equity_curve=all_equity,
+        metrics=metrics,
+    )
+    return _portfolio_job_finish(ok_symbols, result, args, strategy_cfg, base_row, max_open_symbols, position_size_pct)
+
+
+def _portfolio_job_finish(
+    ok_symbols: list[str],
+    result: BacktestResult,
+    args: Namespace,
+    strategy_cfg: dict[str, Any],
+    base_row: dict[str, Any],
+    max_open_symbols: int,
+    position_size_pct: float,
+) -> tuple[int, dict[str, Any]]:
+    m = result.metrics
     sym_list = ",".join(ok_symbols)
     print(f"\n=== PORTFOLIO ({sym_list}) ===", flush=True)
-    print(f"Bars (timeline union): {len(result.equity_curve)}  Trades: {m.get('n_trades', 0)}", flush=True)
+    print(f"Bars (equity points): {len(result.equity_curve)}  Trades: {m.get('n_trades', 0)}", flush=True)
     print(
         f"Win rate: {m.get('win_rate', 0) * 100:.2f}%  "
         f"Profit factor: {m.get('profit_factor')}  "
@@ -181,7 +385,11 @@ def run_portfolio_job(
     if args.export_summary:
         p = Path(args.export_summary)
         p.parent.mkdir(parents=True, exist_ok=True)
-        save_run_summary(p, m, strategy_cfg, symbol="PORTFOLIO", extra={"portfolio_symbols": ok_symbols})
+        extra: dict[str, Any] = {"portfolio_symbols": ok_symbols}
+        if m.get("portfolio_yearly"):
+            extra["portfolio_yearly_chunks"] = m.get("portfolio_yearly_chunks")
+            extra["portfolio_yearly_warmup_days"] = m.get("portfolio_yearly_warmup_days")
+        save_run_summary(p, m, strategy_cfg, symbol="PORTFOLIO", extra=extra)
         print(f"Wrote run summary JSON: {p}", flush=True)
 
     ok_row = {

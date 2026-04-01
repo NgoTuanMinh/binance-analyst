@@ -21,6 +21,8 @@ SLIPPAGE_BPS: float = 1.0
 # Portfolio backtest (``--portfolio``): tối đa N symbol có vị thế; mỗi lệnh ~pct equity.
 PORTFOLIO_MAX_OPEN_SYMBOLS: int = 5
 PORTFOLIO_POSITION_SIZE_PCT: float = 0.2
+# Số ngày lịch sử nến trước đầu năm (chunk) để prepare chỉ báo MTF ổn định khi --portfolio-yearly
+PORTFOLIO_YEARLY_WARMUP_DAYS: int = 120
 
 # Multi-symbol CLI (scripts/run_backtest.py): process pool size. ``0`` = all logical CPUs.
 # Ignored for single-symbol runs. Override per invocation with ``--workers`` or env
@@ -47,6 +49,7 @@ DEFAULT_BACKTEST_CONFIG: dict[str, Any] = {
     "slippage_bps": SLIPPAGE_BPS,
     "portfolio_max_open_symbols": PORTFOLIO_MAX_OPEN_SYMBOLS,
     "portfolio_position_size_pct": PORTFOLIO_POSITION_SIZE_PCT,
+    "portfolio_yearly_warmup_days": PORTFOLIO_YEARLY_WARMUP_DAYS,
     "ema_period": EMA_PERIOD,
     "rsi_period": RSI_PERIOD,
     "supertrend_period": SUPERTREND_PERIOD,
